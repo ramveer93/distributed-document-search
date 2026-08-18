@@ -220,15 +220,9 @@ all of them. That is the main reason the latency budget holds.
 | --- | --- | --- | --- | --- |
 | Write path — upload to searchable | [index.png](resources/index.png) | [.excalidraw](resources/index-flow.excalidraw) | [index-flow.md](resources/index-flow.md) | 🎥 [video](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a) |
 | Read path — search | [search.png](resources/search.png) | [.excalidraw](resources/search-flow.excalidraw) | [search-flow.md](resources/search-flow.md) | 🎥 [video](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2) |
-| Fetch, download, delete | [document.png](resources/document.png) | [.excalidraw](resources/document-flow.excalidraw) | — | — |
+| Fetch, download, delete | [document.png](resources/document.png) | [.excalidraw](resources/document-flow.excalidraw) | [DESIGN.md](DESIGN.md#fetch-download-and-delete) | — |
 | Sharding and capacity | — | — | [sizing.md](resources/sizing.md) | — |
 | Design document | — | — | [DESIGN.md](DESIGN.md) | — |
-
-<details>
-<summary><b>Fetch, download and delete</b> — 404-not-403, the primary-vs-replica read, soft delete and retention</summary>
-
-![Document flow](resources/document.png)
-</details>
 
 Every diagram is exported from [excalidraw.com](https://excalidraw.com), where
 the `.excalidraw` sources also open for editing.
@@ -288,51 +282,23 @@ Every row is a deliberate scope decision, not an unfinished one.
 
 ## Observability
 
-![Observability](resources/observability.png)
+Grafana at http://localhost:3000/d/deeprunner/deeprunner, no login. Metrics come
+from Prometheus, logs from Loki via Alloy. What each metric is for, and why
+`request_id` is a log field rather than a Prometheus label, is in
+[DESIGN.md](DESIGN.md#24-observability).
 
-```
-metrics   Prometheus → Grafana    RED per route, cache hit ratio, outbox depth,
-                                  consumer lag, documents by status
-logs      Loki       → Grafana    structured JSON, searchable by request_id
-traces    —                       not built; request_id correlation instead
-```
-
-**Prometheus pulls.** The services never push anywhere — they expose
-`/metrics` and print JSON to stdout. Alloy tails the Docker socket and ships
-the logs to Loki. Nothing inside a service knows either exists, which is why a
-rebuilt container is picked up again with no coordination.
-
-The metrics worth having are the ones revealing **silent** failure. A failed
-index is visible — someone complains. These are not:
-
-| | |
-| --- | --- |
-| `outbox_unpublished_depth` | growing → the relay is stuck; documents are being accepted and 202'd, and nothing will ever index them |
-| `kafka_consumer_lag` | growing → the index is drifting from the source of truth |
-| `documents_by_status{status="FAILED"}` | a backlog nobody is draining |
-| DLQ depth | **alert at > 0, not > 100** — one dead-lettered `DELETE` means a document the user removed is still findable |
-
-`request_id` is deliberately **not** a Prometheus label. One time series per
-unique label combination means a label per request would mint a permanent
-series every time and take the TSDB down. Labels stay bounded — `service`,
-`method`, `route`, `status` — and `route` is the *route rule*
-(`/documents/<doc_id>`), never the path, for the same reason.
-
-High-cardinality identifiers live in the log line instead, where Loki parses
-them at query time:
-
-```
-{job="deeprunner"} | json | request_id = "r-f3219a8948b0"
-```
-
-One id flows gateway → api → outbox row → Kafka message → indexer, so a single
-grep follows a document from HTTP request to indexed:
+One request id flows gateway → api → outbox row → Kafka message → indexer, so a
+single grep follows a document from HTTP request to indexed:
 
 ```bash
 docker compose logs gateway api indexer | grep r-f3219a8948b0
 ```
 
-Or paste it into the **Request ID** box on the Grafana dashboard.
+In Grafana, paste it into the **Request ID** box, or query Loki directly:
+
+```
+{job="deeprunner"} | json | request_id = "r-f3219a8948b0"
+```
 
 ---
 
@@ -389,20 +355,9 @@ it was found, including the first hypothesis that measured wrong, is in
 
 ## Not built
 
-Gaps in the code you are about to run, stated plainly rather than left to be
-discovered:
-
-- **Idempotency.** Uploading the same file twice creates two documents. The
-  design calls for an `Idempotency-Key` deduped in Redis; it is not
-  implemented.
-- **Integration tests.** The unit suite covers logic and the smoke suite
-  covers the running stack, but nothing tests the two together against real
-  Postgres, Kafka and Elasticsearch.
-- **Per-tenant metrics.** `documents_by_status` has no tenant label, so
-  Grafana counts across all tenants while the UI shows one.
-- **OCR, passage chunking, presigned upload** — see the table above.
-
-What would additionally be needed for production — tracing, alert rules, audit
-logging — is in [DESIGN.md](DESIGN.md#2--production-readiness).
+The prototype-versus-production table above covers the deliberate scope cuts.
+The honest gap list — idempotency, integration tests, tracing, alert rules,
+audit logging, per-tenant metric labels — is in
+[DESIGN.md](DESIGN.md#what-is-not-built).
 
 ---

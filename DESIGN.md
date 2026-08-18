@@ -77,9 +77,10 @@ Three rules:
 1. **S3 lands before the row.** A row can never point at bytes that are not
    there. The reverse leaves an orphan blob, which is harmless.
 2. **Row and outbox row commit together.** No dual write, so there is no window
-   where Postgres has a document and Kafka never hears about it. Production uses
-   Debezium on the WAL; the prototype polls the outbox with
-   `FOR UPDATE SKIP LOCKED`.
+   where Postgres has a document and Kafka never hears about it. Production uses Debezium,
+   which reads Postgres's write-ahead log (the WAL — the sequential record of
+   every change, which Postgres already keeps for crash recovery); the prototype
+   polls the outbox table with `FOR UPDATE SKIP LOCKED`.
 3. **`/raw` is immutable, `/text` is derived.** A reindex reads the extracted
    text instead of re-parsing 10M PDFs.
 
@@ -126,6 +127,26 @@ cached as a bitset. `title^3` makes a title match count triple.
 
 Fuzzy matching, highlighting and faceting come free with the engine choice.
 Full detail in [search-flow.md](resources/search-flow.md).
+
+## Fetch, download and delete
+
+![Document flow](resources/document.png)
+
+`GET /documents/{id}` reads Postgres, not Elasticsearch — it is the endpoint
+clients poll straight after writing, so it is the one read that must be
+strongly consistent. That also rules out serving it from a read replica.
+
+Bytes never travel inside a JSON response. A small body is already in the row
+and comes back inline; anything in S3 becomes a link, and
+`GET /documents/{id}/raw` answers `302` with a presigned URL valid for 60 s.
+Presigning is a local HMAC, so the service hands out the URL without touching
+the object — identical work at 20 KB or 200 MB.
+
+Delete is soft. The row moves to `DELETED` and the same outbox-and-Kafka path
+carries the removal to Elasticsearch, which is why deletes cannot overtake the
+updates in front of them. A retention job hard-deletes later; the indexer
+ignores those events because the index was already cleaned when the status
+changed.
 
 ## Multi-tenancy
 
@@ -175,28 +196,71 @@ Errors are RFC 7807 and carry the `X-Request-Id` that also appears in the logs
 on both sides of Kafka. Contracts and 29 assertions are in the
 [Postman collection](postman/deeprunner.postman_collection.json).
 
-## Consistency
+## Consistency — when can you read back what you just wrote?
 
-Postgres is strongly consistent; search is eventually consistent. A document is
-durable and fetchable by id the moment `POST /documents` returns, and searchable
-about a second later.
+That is the whole question this section answers. You upload a document. A second
+later you search for it. Is it there?
 
-That trade is deliberate. Read-your-writes on search would mean synchronous
-indexing, which puts PDF extraction on the request path to solve a problem
-nobody has — nobody uploads a document and immediately full-text searches for
-it. They do immediately look at it, which is why `GET /documents/{id}` reads
-Postgres and is strongly consistent.
+There are two honest answers a system can give:
 
-The status field makes the lag visible rather than mysterious: `PENDING → LIVE`,
-or `FAILED` with a reason.
+- **Immediately.** The write is not finished until everyone can see it. Simple to
+  reason about, but the write has to wait for every system that stores a copy.
+- **Shortly.** The write finishes as soon as the data is safe, and other systems
+  catch up a moment later. Faster writes, but there is a window where two parts
+  of the system disagree.
 
-Delivery is at-least-once, so consumer operations are idempotent — an upsert
-keyed by `doc_id`, and deleting something already gone is a no-op. Elasticsearch
-`version_type=external` drops a stale event that overtakes a newer one.
+We give different answers for different reads, on purpose:
 
-The costs, stated plainly: ~1 s until a document is searchable, a ~600 GB index
-duplicating what Postgres already holds, replay to design around, and up to 5 s
-of cache staleness.
+| You do this | You see it | Because |
+| --- | --- | --- |
+| Upload, then open the document | immediately | it reads Postgres, where the write landed |
+| Upload, then search for it | after ~1 second | search reads Elasticsearch, which is updated in the background |
+
+### Why not make search immediate too
+
+Making search immediate means indexing before responding to the upload. Indexing
+means opening the PDF and extracting its text, which is slow and can fail. So
+every upload would wait on it, and an Elasticsearch problem would fail uploads
+that had already been safely stored.
+
+We would be paying that on every upload to solve a problem almost nobody has.
+People do not upload a document and immediately full-text search for it. They do
+immediately *open* it — which is exactly the read we kept instant.
+
+### Making the gap visible
+
+A one-second window where a document exists but is not findable is only
+dangerous if it is invisible. So the document carries a status the UI shows:
+
+```
+PENDING  →  LIVE            stored, then searchable
+PENDING  →  FAILED          with the reason, e.g. "needs OCR"
+```
+
+Nobody has to guess whether the system is slow or broken.
+
+### Why the same document never gets indexed twice, wrongly
+
+The queue guarantees each message is delivered *at least* once — on a network
+hiccup it may deliver the same one again. So every operation is written to be
+safe to repeat:
+
+- Indexing writes the document *at* its id rather than adding a new one. Running
+  it twice leaves exactly one document.
+- Deleting something already deleted does nothing rather than erroring.
+- Each document carries a version number, and Elasticsearch rejects any update
+  carrying an older version than the one it already has. A delayed message
+  cannot overwrite newer data.
+
+Without that third rule a redelivered old message could quietly undo a newer
+edit, which is the kind of bug that surfaces weeks later as "this document keeps
+reverting".
+
+### What this costs
+
+About a second before a document is searchable. An index of roughly 600 GB
+holding a copy of what Postgres already has. Code that must tolerate the same
+message arriving twice. And up to five seconds of cache staleness, covered next.
 
 ## Caching
 
@@ -244,7 +308,8 @@ Failures are classified before they are retried. An encrypted PDF retried five
 times reaches the same answer several minutes later, so permanent failures go
 straight to `FAILED`. Transient ones move through a 30 s / 5 m / 30 m ladder on
 separate topics, so the main partition commits and keeps moving; the window
-outlasts a rolling Elasticsearch restart. If Elasticsearch is down entirely,
+outlasts a rolling Elasticsearch restart. Anything still failing after the last
+rung goes to a dead-letter queue (DLQ) — a topic of messages that need a human. If Elasticsearch is down entirely,
 pause the consumer and let lag build rather than retrying 50,000 messages.
 
 A failed delete is worse than a failed index — a missing document gets
@@ -289,89 +354,219 @@ The initial backfill is the exception. Indexing 1B documents at ~1 s of
 extraction CPU each is ~30 CPU-years — a migration project with its own capacity
 plan, not a deployment.
 
-## 2.2 Resilience
+## 2.2 Resilience — staying useful when something breaks
 
-Built: retry with exponential backoff and jitter, a retry-topic ladder so a slow
-message never blocks a partition, a DLQ, and the transactional outbox.
+**The problem.** This system has six moving parts, and in production something is
+always slightly broken. The question is not how to prevent that; it is what the
+user experiences when it happens.
 
-The useful question during an incident is not "is it up" but "what still works":
+The wrong answer is that any single failure takes the whole service down.
 
-| Down | Search | Upload | Fetch |
+### What still works when each piece is down
+
+Worth deciding before an incident rather than during one:
+
+| Broken | Search | Upload | Fetch a document |
 | --- | --- | --- | --- |
 | Redis | ✅ slower | ✅ | ✅ |
 | Elasticsearch | ❌ | ✅ | ✅ |
 | Kafka | ✅ | ✅ | ✅ |
 | Indexer | ✅ | ✅ | ✅ |
-| S3 | ✅ | ⚠ small only | ⚠ metadata only |
+| S3 | ✅ | ⚠ small files only | ⚠ metadata only |
 | Postgres | ✅ | ❌ | ❌ |
 
-Two rows are design decisions rather than luck. Search survives a Postgres
-outage because it never touches Postgres. Uploads survive an Elasticsearch
-outage because indexing is asynchronous.
+Two of those rows were bought deliberately.
 
-The Redis row is the one most easily broken in code — a cache client that raises
-on connection failure turns an optional dependency into a required one.
+**Search survives Postgres being down** because search never reads Postgres —
+everything it shows comes from Elasticsearch. A choice originally made for speed
+turns out to buy availability too.
 
-**Circuit breakers.** Retries help one failing request against a healthy
-service and actively hurt when the service is down. Gateway and API hops open
-after 5 failures in 10 s and half-open probe after 30 s. Redis opens immediately
-and falls through to Elasticsearch. The indexer pauses its consumer entirely —
-the correct response to a dead search cluster is to stop consuming and let Kafka
-buffer.
+**Uploads survive Elasticsearch being down** because uploading only has to store
+the file; indexing happens later. Work piles up in the queue and drains when
+Elasticsearch returns.
 
-**Failover.** Postgres Multi-AZ with automated promotion, 60–120 s. Elasticsearch
-replica shards across 3 AZs and Redis Cluster both promote in seconds. Kafka runs
-replication factor 3 with `min.insync.replicas=2`, which together with `acks=all`
-is what makes "we told the client 202" honest.
+The Redis row is the one most easily lost in code. Redis is only a cache, so a
+failure should mean "slower", not "broken" — but that is only true if the code
+treats a cache error as a miss and carries on. Written the obvious way, a Redis
+outage becomes a total outage.
+
+### Retrying without making things worse
+
+**The problem.** When a request fails, retrying is usually right. But if the
+service is down rather than glitching, thousands of clients retrying at once
+means it gets hammered the instant it tries to come back — so it falls over
+again.
+
+Three things stop that:
+
+**Wait longer each time.** First retry after 30 seconds, then 5 minutes, then
+30 minutes. A brief glitch is caught by the first; a real outage is given time
+to end.
+
+**Add randomness.** If every failed message waits exactly 30 seconds, they all
+return simultaneously and the spike repeats. A random offset spreads them out.
+Cheap, and skipping it is a classic way to build an accidental denial-of-service
+against your own recovering service.
+
+**Stop trying when it is clearly down.** A *circuit breaker* watches failures,
+and after enough of them (say 5 within 10 seconds) it stops sending requests
+entirely for a while, failing instantly instead. Every so often it lets one
+request through to check; if that works, normal traffic resumes.
+
+Failing instantly sounds worse than trying, but it is better for everyone: the
+caller gets a fast, clear error instead of a 30-second hang, and the broken
+service gets quiet time to recover.
+
+For the indexer the equivalent is simply to stop reading the queue. Messages
+accumulate in Kafka, which is what a queue is for, and processing resumes when
+Elasticsearch is healthy.
+
+### When a machine dies
+
+Everything runs in at least two copies across separate data centres
+(availability zones), so losing one machine — or one whole zone — is survivable.
+
+| | How it recovers | Time |
+| --- | --- | --- |
+| Postgres | a standby copy is promoted to primary | 60–120 s |
+| Elasticsearch | copies of each shard already live on other nodes | seconds |
+| Redis | a replica is promoted | seconds |
+| Kafka | every message is stored on 3 brokers | seconds |
+| Services | Kubernetes starts a replacement pod | seconds |
+
+Kafka is worth one extra note. It is configured so that a write is only
+acknowledged once **at least two** brokers have it. That is what makes the `202`
+we return honest: if the broker that accepted the message dies a second later,
+another copy already exists, so the document still gets indexed.
 
 ## 2.3 Security
 
-**Authentication.** The gateway currently mints RS256 tokens itself; production
-swaps in an OIDC provider. The verification path does not change — it already
-fetches JWKS and validates `iss`, `aud`, `exp` and signature.
+**The problem.** Several companies' documents sit in one database, one search
+index and one S3 bucket. Nothing physically separates them. Acme's documents are
+invisible to Globex only because the code keeps them apart — so the security
+question is really: how many independent mistakes would it take before one
+customer sees another's files?
 
-RS256 rather than HS256: with a shared secret, any service that can verify a
-token can mint one for any tenant.
+### Proving who is asking
 
-Tokens last 15 minutes. Revocation needs three layers, since a JWT cannot be
-un-issued — short expiry, a `jti` denylist in Redis for emergencies, and the
-tenant status check that already runs per request.
+When a request arrives, we need to know which company it belongs to, and the
+answer must not be forgeable.
 
-**Isolation** is covered in [§1](#multi-tenancy). Production would add Postgres
-row-level security as a fifth layer, so a hand-written query in a migration is
-still scoped, and per-tenant KMS keys on the S3 prefix so a bucket-policy mistake
-fails closed.
+On login the user gets a **token** — a small signed blob containing their user
+id and their company, which the browser sends with every later request. Signed
+means we can detect any change to it: edit "acme" to "globex" and the signature
+no longer matches, so the token is rejected.
 
-**Encryption.** TLS 1.3 at the edge with HSTS; mTLS between services (currently
-plaintext on the compose network). At rest: encrypted volumes for Postgres and
-Elasticsearch, SSE-KMS on S3 with a per-tenant key, and backups encrypted under a
-separate key in a separate account. The extracted text in `/text` needs the same
-protection as `/raw` — it is the searchable content, so it is at least as
-sensitive as the original.
+The signing method matters. There are two families:
 
-**Secrets.** `.env` is fine for compose and unacceptable in production. Secrets
-Manager or Vault, injected at runtime, rotated, with short-lived database
-credentials. The RS256 private key is already never written to disk; that
-property should survive the move to an external IdP.
+- **Shared secret.** One password signs and checks tokens. Anyone able to *check*
+  a token can also *create* one — so every service could mint a token for any
+  company.
+- **Key pair.** A private key signs; a matching public key only checks. We use
+  this. The gateway holds the private key; every other service gets the public
+  half and can verify but never forge.
 
-**API surface.** Built: per-tenant rate limiting, Pydantic validation on every
-input, a 20 MB body cap, RFC 7807 errors that leak nothing, presigned URLs scoped
-to one object for 60 s. To add: a WAF, per-endpoint limits (search and upload
-have very different cost profiles), size limits at the ALB, and dependency and
-image scanning in CI.
+That distinction is the whole reason for the choice. In a system whose entire
+isolation model rests on one claim inside a token, no service that merely reads
+tokens should be able to write one.
 
-Audit logging is missing and most enterprise buyers would require it — who read
-which document, when, from where, written to storage the application cannot
-rewrite.
+Tokens expire after 15 minutes. A signed token cannot be un-signed, so revoking
+access early needs three things: short expiry so it lapses soon anyway, a list of
+banned token ids in Redis for emergencies, and a check of the company's status on
+every request — so suspending an account takes effect immediately even though
+existing tokens remain valid.
+
+The prototype's gateway issues tokens itself. In production that is replaced by
+an identity provider (Cognito, Auth0, Keycloak). The checking side does not
+change, because it already fetches the provider's public keys over HTTP and
+validates who issued the token, who it is for, and when it expires.
+
+### Keeping tenants apart
+
+Covered in [§1](#multi-tenancy): four independent layers, so one mistake is never
+enough. Production adds two more:
+
+- **Database-enforced scoping** (Postgres row-level security), so even a
+  hand-written query in a migration script cannot read another company's rows.
+- **A separate encryption key per company** on their S3 folder, so a
+  mis-configured bucket permission still cannot decrypt anyone's files.
+
+Both exist to protect against the case the application-level checks miss: someone
+bypassing the application.
+
+### Encryption
+
+Two different risks, protected separately.
+
+**Data moving over a network** could be read by anyone able to observe the
+traffic. HTTPS handles browser-to-service. Between our own services it is
+currently plain HTTP on a private Docker network, which is fine locally and not
+in production, where services should also verify each other's identity, not just
+encrypt.
+
+**Data sitting on disk** could be read by anyone who obtains the disk — a stolen
+backup, a decommissioned drive, a snapshot copied to the wrong account. So
+Postgres volumes, Elasticsearch volumes, the S3 bucket and every backup are
+encrypted at rest, with backups under a different key in a different account so
+one compromised account cannot reach both.
+
+One easily-missed detail: the extracted text we cache in S3 needs the same
+protection as the original file. It is the *searchable content* of the document,
+so it is at least as sensitive as the PDF it came from.
+
+### Secrets
+
+Passwords and keys live in a `.env` file, which is fine for a prototype and
+unacceptable in production, where they belong in a secrets manager, are injected
+at runtime rather than baked into an image, and are rotated on a schedule.
+Database credentials should be short-lived and issued on demand.
+
+One property already worth keeping: the private signing key is generated in
+memory at startup and never written to disk, so there is no key file to leak or
+commit.
+
+### The public surface
+
+Built: rate limiting per company ([README](README.md#rate-limiting)), validation
+on every input, a 20 MB upload cap, errors that never expose internal details,
+and download links that work for one file for 60 seconds.
+
+To add: a filter in front of the service to block common attack traffic,
+different rate limits per endpoint (a search and an upload cost very different
+amounts), size limits enforced at the load balancer as well as in the
+application, and automated scanning of dependencies and container images for
+known vulnerabilities.
+
+**Audit logging is missing**, and most enterprise buyers would require it: a
+record of who read which document, when, and from where, written somewhere the
+application itself cannot alter. Without it there is no way to answer "who saw
+this file?" after an incident.
 
 ## 2.4 Observability
 
+![Observability](resources/observability.png)
+
 Built: Prometheus metrics with RED per route, Loki for structured logs searchable
 by `request_id`, Grafana over both, and correlation that survives the Kafka
-boundary.
+boundary. Prometheus pulls — services expose `/metrics` and print JSON to
+stdout, Alloy tails the Docker socket. Nothing inside a service knows either
+exists, so a rebuilt container is picked up with no coordination.
 
 The principle is to measure what fails silently. A failed index produces a
-complaint; a stuck relay, a lagging consumer and a dead-lettered delete do not.
+complaint; these do not:
+
+| | |
+| --- | --- |
+| `outbox_unpublished_depth` | the relay is stuck — documents accepted and 202'd that will never index |
+| `kafka_consumer_lag` | the index is drifting from the source of truth |
+| `documents_by_status{status="FAILED"}` | a backlog nobody is draining |
+| DLQ depth | one dead-lettered `DELETE` is a document the user removed and can still find |
+
+`request_id` is deliberately not a Prometheus label. One series per unique label
+combination means a label per request mints a permanent series every time and
+takes the TSDB down. Labels stay bounded — `service`, `method`, `route`,
+`status` — and `route` is the route rule, never the path. High-cardinality
+identifiers go in the log line instead, where Loki parses them at query time.
 
 Missing: distributed tracing. `request_id` gives causality but not per-hop
 timing — you can see a request touched three services, not that Elasticsearch
@@ -379,8 +574,8 @@ took 40 ms of its 140 ms. OpenTelemetry auto-instruments Flask, SQLAlchemy, Redi
 and Elasticsearch; the manual part is carrying `traceparent` across Kafka, where
 auto-instrumentation stops.
 
-Also missing: alert rules. The minimum set is SLO burn-rate on search latency and
-availability, `outbox_unpublished_depth` climbing, consumer lag climbing, and DLQ
+Also missing: alert rules. The minimum set is burn-rate on the search latency
+and availability objectives (see [§2.7](#27-sla--9995)), `outbox_unpublished_depth` climbing, consumer lag climbing, and DLQ
 depth above zero.
 
 ## 2.5 Performance
@@ -403,9 +598,9 @@ that tolerates lag — noting `GET /documents/{id}` deliberately does not, since
 clients poll it immediately after writing.
 
 **Index management.** Shard count is immutable, so resharding means a new index
-and an alias swap. That is why `docs-search` is an alias from day one. Add ILM
-for retention, force-merge read-only indices, watch shard size against the
-10–50 GB target.
+and an alias swap. That is why `docs-search` is an alias from day one. Add index lifecycle
+management for retention, force-merge indices that are no longer written to, and
+watch shard size against the 10–50 GB target.
 
 **Query.** Already: routing, `filter` rather than `must`, snippets from stored
 fields, deep pagination capped at page 500. Next: `search_after` cursors end to
@@ -413,114 +608,265 @@ end, `_source` filtering, adaptive replica selection.
 
 ## 2.6 Operations
 
-**Deployment.** Rolling updates by default — services are stateless with
-readiness gates, two replicas minimum per AZ so a deploy never drops below
-capacity.
+### Shipping code without dropping requests
 
-Blue-green earns its place in one case: an Elasticsearch mapping change. Mappings
-are largely immutable, so changing an analyzer or field type means reindexing.
+**The problem.** Deploying means replacing running processes. Stop the old one
+before the new one is ready and every request in flight is lost — and from
+[§2.7](#27-sla--9995), a five-minute deploy outage spends a quarter of the
+month's entire downtime allowance.
+
+**What we do.** Rolling updates: Kubernetes starts a new pod, waits for it to
+report ready, moves traffic across, and only then stops an old one. Services can
+be replaced this way because they hold no state — no in-memory session, no local
+data — so any pod can serve any request.
+
+Two rules make it safe. A pod must pass a readiness check before receiving
+traffic, and there must be at least two replicas per availability zone so
+removing one never drops the service below the capacity it needs.
+
+### The one change rolling updates cannot do
+
+**The problem.** Elasticsearch mappings — the schema saying which field is text,
+which is a keyword, which analyzer stems the words — are mostly immutable. You
+cannot change an analyzer on a live index. But documents were indexed *using*
+that analyzer, so the only way to change it is to build a new index and re-index
+every document into it.
+
+**What we do.** Blue-green: build the new thing alongside the old one, then
+switch traffic in a single step.
+
+The application never talks to an index directly. It talks to `docs-search`,
+which is an **alias** — a name pointing at a real index. That indirection is
+there from day one precisely so this is possible:
 
 ```
 1  create docs-v2 with the new mapping
-2  backfill from Postgres + S3 /text
-3  dual-write both indices while it catches up
-4  compare counts, spot-check relevance
-5  swap the docs-search alias — atomic, and instantly reversible
-6  keep docs-v1 for a week, then drop it
+2  backfill it from Postgres + the extracted text in S3
+3  write to both indices while the backfill catches up
+4  compare document counts, spot-check that results still rank sensibly
+5  point the docs-search alias at docs-v2   ← the cutover, one atomic operation
+6  keep docs-v1 for a week in case something surfaces, then delete it
 ```
 
-The alias swap is the cutover, and rollback is the same command with the old
-name. That is what makes the change safe to attempt on a Tuesday.
+Step 5 is the entire deployment. If results look wrong, rollback is the same
+command with the old name — seconds, not a re-index. That reversibility is what
+makes the change safe to attempt on a normal working day rather than at 2am.
 
-**Migrations.** `create_all()` at startup is prototype-only. Production needs
-Alembic with expand/contract, because rolling deploys mean old and new code run
-at once: add the nullable column and backfill, deploy code that writes both and
-reads new, drop the old column a release later. Never a destructive migration in
-the same deploy as the code that depends on it.
+### Changing the database while two versions are running
 
-**Backup and recovery.**
+**The problem.** A rolling deploy means old and new code are live *at the same
+time*, for minutes. If the new version's migration drops a column, every request
+still being served by the old version starts failing.
+
+**What we do.** Split every schema change across three releases, adding before
+removing — the **expand/contract** pattern:
+
+```
+expand    add the new column as nullable, deploy, backfill it
+            → old code ignores it, new code can use it, nothing breaks
+migrate   deploy code that writes both old and new, reads new
+contract  a release later, once nothing reads it, drop the old column
+```
+
+The rule underneath: never ship a destructive migration in the same deploy as
+the code that depends on it. The prototype uses `create_all()` at startup, which
+is fine for a demo and unacceptable in production; Alembic is the tool for the
+above.
+
+### Backup and recovery
+
+Two numbers describe any recovery plan, and they answer different questions:
+
+- **RPO — Recovery Point Objective.** How much *data* you can afford to lose,
+  measured in time. An RPO of 5 minutes means that after a disaster, the last
+  5 minutes of writes may be gone.
+- **RTO — Recovery Time Objective.** How long you can afford to be *down* while
+  restoring. An RTO of 30 minutes means you are serving traffic again within
+  half an hour.
+
+RPO looks backwards at data; RTO looks forwards at time. They are costed
+separately, because tightening either one is expensive in a different way.
 
 | | Method | RPO | RTO |
 | --- | --- | --- | --- |
-| Postgres | WAL archiving, PITR | < 5 min | ~30 min |
+| Postgres | continuous WAL archiving, point-in-time restore | < 5 min | ~30 min |
 | S3 | versioning + cross-region replication | ~15 min | minutes |
-| Elasticsearch | snapshots, or rebuild | n/a | hours |
-| Redis | none needed | n/a | instant |
+| Elasticsearch | snapshots — or just rebuild it | n/a | hours |
+| Redis | nothing to back up | n/a | instant |
 
-The last two rows are the interesting ones. Elasticsearch does not strictly need
-backups — it is derived from Postgres and S3, so recovery is a reindex and
-snapshots only optimise restore time. Redis holds caches and rate-limit counters;
-losing it costs a cold cache for a minute. Backup strategy follows from
-architecture rather than being bolted on.
+The bottom two rows are the interesting ones, and they are a payoff from a
+decision made in [§1](#components).
 
-Restores need testing on a schedule. An untested backup is a hypothesis.
+**Elasticsearch does not strictly need backups.** Every document in it is
+derived from Postgres and S3, so if the cluster is lost entirely the recovery
+plan is to re-index — slow, but nothing is unrecoverable. Snapshots are worth
+taking to make that faster, not to make it possible. Hence "n/a" for RPO: there
+is no data here that exists only here.
 
-**Runbooks.** The metrics already point at the failure modes that need one:
-outbox depth climbing (relay stuck), consumer lag climbing (indexer behind), DLQ
-non-empty (poisoned message), `FAILED` backlog growing (extraction breaking on a
-document class), cache hit ratio collapsing.
+**Redis holds only caches and rate-limit counters.** Losing it costs a cold
+cache for about a minute.
+
+That asymmetry is why keeping one authoritative source of truth pays off long
+after the design meeting: backup strategy follows from the architecture instead
+of being bolted onto it.
+
+One caveat that applies to all of it — restores must be tested on a schedule. An
+untested backup is a hypothesis, not a backup.
+
+### Runbooks
+
+**The problem.** At 3am, whoever is paged needs to know what a climbing graph
+means and what to do about it, without reading the source.
+
+Each failure mode needs a written procedure, and the metrics from
+[§2.4](#24-observability) already name them:
+
+| Symptom | What it means |
+| --- | --- |
+| outbox depth climbing | the relay is stuck — documents are being accepted that will never index |
+| consumer lag climbing | the indexer is falling behind |
+| DLQ not empty | a message failed every retry; if it was a delete, a removed document is still findable |
+| `FAILED` backlog growing | extraction is breaking on a whole class of document |
+| cache hit ratio collapsing | an invalidation storm, or a cold cluster after a restart |
 
 ## 2.7 SLA — 99.95%
 
-21.9 minutes a month. Deployments count, so anything short of zero-downtime eats
-the budget outright.
+### What the number means
 
-Serial dependencies multiply:
+An SLA of 99.95% is a promise that the service is working 99.95% of the time.
+The other 0.05% is the part you are allowed to be broken.
+
+An average month is about 43,800 minutes, so:
+
+```
+99.9 %  →  43.8 min/month of downtime
+99.95%  →  21.9 min/month     ← what we promised
+99.99%  →   4.4 min/month
+```
+
+Twenty-two minutes a month. That includes planned work, so if a deploy takes the
+service down for five minutes you have spent nearly a quarter of the month's
+allowance on a release.
+
+### The problem: you cannot simply declare it
+
+A search request passes through three components in a row. It fails if **any**
+of them is down, so their individual availabilities multiply:
 
 ```
 gateway        99.99%
 api            99.99%
-Elasticsearch  99.95%
+Elasticsearch  99.95%   ← the number we hoped to promise
                ───────
-composite      99.93%   ← under target
+whole path     99.93%   →  30.7 min/month
 ```
 
-Elasticsearch is the binding constraint, so that is where redundancy spend goes:
-more replica shards, three AZs, dedicated master nodes so a data-node problem
-cannot take out cluster coordination.
+The chain is *less* available than its weakest part, because each hop adds its
+own failure chances on top. We promised 21.9 minutes and the architecture
+delivers 30.7 — **nine minutes a month over budget**, before anyone writes a bug
+or runs a deploy.
 
-Redis is deliberately absent from that chain. It degrades to a cache miss rather
-than an error, which is worth more than any amount of Redis redundancy.
+That is the real finding. You do not get to pick an availability target; the
+architecture picks it for you, and the only question is whether it matches what
+you promised.
 
-The SLI is successful searches over total searches, excluding 4xx, counting a
-slow-but-successful search as a success. A latency SLO sits alongside: 95% under
-500 ms. Writes get a separate objective — a `202` that eventually indexes is a
-success even if the indexer was briefly behind.
+### The fix
 
-21.9 minutes is a budget, not a target. Burn-rate alerting over one hour and six
-hours says whether an incident threatens the month. Healthy budget, ship;
-nearly spent, freeze risky changes. That is the mechanism that makes the number
-mean something.
+Elasticsearch is the weakest link, so it is the only place worth spending. Take
+it from 99.95% to 99.99% with replica shards across three availability zones and
+dedicated master nodes, so losing a data node cannot take out cluster
+coordination:
+
+```
+99.99% × 99.99% × 99.99%  =  99.97%  →  13.1 min/month
+```
+
+Now there is real headroom under the 21.9 promised. Spending the same money on
+the gateway instead would have moved the total almost not at all, which is the
+point of finding the weakest link before writing cheques.
+
+**Redis is deliberately not in that chain.** If Redis is down, search still
+works — every request just misses the cache and goes to Elasticsearch. A
+dependency that degrades instead of failing does not enter the multiplication at
+all, and that is worth more than any amount of Redis redundancy.
+
+### Measuring it
+
+You cannot manage a number you do not measure, and "is it up" is too vague to
+count. The definition:
+
+```
+availability = successful searches / total searches
+```
+
+Client mistakes (4xx) do not count against us — a malformed query is not an
+outage. A search that returns correct results slowly counts as a **success**,
+because the user got their answer; slowness is tracked separately as "95% of
+searches under 500 ms".
+
+Writes get their own target, because they fail differently. A `202` that indexes
+a few seconds late is a success, not an outage.
+
+### Spending the budget
+
+Those 21.9 minutes are a budget to spend, not a target to avoid. Ship features
+while it is healthy; freeze risky changes when it is nearly gone.
+
+To know which, alert on how *fast* the budget is being consumed rather than on
+raw error counts. A short window (one hour) catches a sudden outage; a longer one
+(six hours) catches a slow bleed that would otherwise go unnoticed until the
+month is spent. That mechanism is what turns 99.95% from a number on a slide
+into something that changes what the team does this week.
 
 ## 2.8 Cost
 
-Roughly, at the brief's scale on AWS:
+All managed services, `us-east-1`, on-demand, 730 hours. Rates below are from
+the AWS Price List API (`pricing.us-east-1.amazonaws.com`), published July–August
+2026. Sizing follows [§2.1](#21-scale--surviving-100) and
+[sizing.md](resources/sizing.md).
 
-| | Monthly |
-| --- | --- |
-| Elasticsearch — 6 data + 3 master + 2 coord | ~$2,400 |
-| Postgres — Multi-AZ, 250 GB | ~$700 |
-| Kafka (MSK) — 3 brokers | ~$450 |
-| Redis (ElastiCache) — 3 nodes | ~$250 |
-| Compute — API + indexer | ~$500 |
-| S3 — 100 GB plus requests | ~$10 |
-| **Total** | **~$4,300** |
+| | Configuration | Rate | Monthly |
+| --- | --- | --- | ---: |
+| OpenSearch — data | 6 × `r6g.xlarge.search` | $0.335/hr | $1,467 |
+| OpenSearch — master | 3 × `m6g.large.search` | $0.128/hr | $280 |
+| OpenSearch — coordinator | 2 × `c6g.xlarge.search` | $0.226/hr | $330 |
+| OpenSearch — storage | 1,200 GB gp3 (600 GB × 1 replica) | $0.122/GB-mo | $146 |
+| RDS PostgreSQL | `db.m6g.large`, Multi-AZ | $0.318/hr | $232 |
+| RDS — storage | 100 GB gp3, Multi-AZ | $0.115/GB-mo ×2 | $23 |
+| MSK | 3 × `kafka.m7g.large` | $0.204/hr | $447 |
+| MSK — storage | 300 GB | $0.100/GB-mo | $30 |
+| ElastiCache Redis | 3 × `cache.m6g.large` | $0.119/hr | $261 |
+| EKS — control plane | 1 cluster | $0.100/hr | $73 |
+| EKS — workers | 3 × `m6g.large` | $0.077/hr | $169 |
+| S3 | 100 GB Standard + requests | $0.023/GB-mo | ~$10 |
+| **Total** | | | **~$3,470** |
 
-Elasticsearch is 56%, so that is where optimisation pays.
+Excluded, because they depend on traffic shape rather than sizing: NAT gateway,
+inter-AZ transfer, and snapshot storage. Together those usually add 10–20%.
 
-Cache harder — the hit rate is ~90%, and every point above that removes traffic
+Two lines are deliberately over-provisioned against §2.1. Postgres holds ~15 GB
+of metadata but gets 100 GB for headroom, and Redis holds ~250 MB but gets three
+nodes — you buy Redis nodes for failover, not for capacity.
+
+**Elasticsearch is 64% of the bill**, so that is where optimisation pays.
+
+Cache harder: the hit rate is ~90%, and every point above that removes traffic
 from the most expensive component. Tier hot/warm, since most searches touch
-recent documents. Run the indexer on spot instances: it is interruption-tolerant
-by construction, because Kafka redelivers anything a killed worker did not
-commit, which is roughly 70% off the one workload that can take it.
+recent documents and warm nodes take cheaper disk. Run the indexer on spot — it
+is interruption-tolerant by construction, because Kafka redelivers anything a
+killed worker did not commit, and that is ~70% off the one workload that can
+safely take it. Reserved Instances or a Compute Savings Plan take 30–40% off the
+steady-state nodes.
 
-Right-size on measurement. The shard count assumes 50 KB of extracted text per
-document. At 5 KB the cluster is a third the size, and shard count cannot be
-changed later without a reindex — so measure a 10k-document sample first.
+Right-size on measurement rather than on this table. The shard count assumes
+50 KB of extracted text per document; at 5 KB the cluster is a third the size,
+and shard count cannot change later without a reindex. Measure a 10k-document
+sample first.
 
-S3 is a rounding error: 100 GB of documents costs about $2.
+S3 is a rounding error — 100 GB of documents costs about $2.30.
 
 ---
+
 # 3 · Experience showcase
 
 ## A similar distributed system I've built
