@@ -8,6 +8,9 @@ Working code, `docker compose up`, and a Postman collection are in this
 repository — see the [README](README.md). This document is the reasoning
 behind it.
 
+**Recorded walkthroughs:** 🎥 [indexing architecture](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a) ·
+🎥 [search architecture](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2) · 🎥 [application demo](https://www.loom.com/share/b500cedbf4aa4f3f84798247edb2cd8e)
+
 | | |
 | --- | --- |
 | [1 · Architecture design](#1--architecture-design) | components, data flow, storage, API, consistency, caching, queue |
@@ -65,7 +68,8 @@ outage.
 
 ![Indexing flow](resources/index.png)
 
-Full detail in [resources/index-flow.md](resources/index-flow.md).
+Talked through in the 🎥 [indexing walkthrough](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a); full detail in
+[resources/index-flow.md](resources/index-flow.md).
 
 ```
 POST /documents  →  bytes durable  →  Postgres row + outbox row (ONE txn)  →  202
@@ -104,7 +108,8 @@ document that silently matches nothing.
 
 ![Search flow](resources/search.png)
 
-Full detail in [resources/search-flow.md](resources/search-flow.md).
+Talked through in the 🎥 [search walkthrough](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2); full detail in
+[resources/search-flow.md](resources/search-flow.md).
 
 ```
 GET /search  →  L1 (in-process, 5s)  →  L2 (Redis, 60s)  →  Elasticsearch, routed

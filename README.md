@@ -12,6 +12,19 @@ Measured on this prototype: **p95 `/search` = 9 ms**, cache hit ~90%.
 
 ---
 
+## Walkthroughs
+
+Three recorded walkthroughs — the two architecture ones talk through the
+Excalidraw diagrams, the third is the running application.
+
+| | | |
+| --- | --- | --- |
+| 🎥 **[Indexing architecture](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a)** | the write path | upload → S3 → outbox → Kafka → extraction → Elasticsearch |
+| 🎥 **[Search architecture](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2)** | the read path | two cache levels, routing, the tenant filter, the latency budget |
+| 🎥 **[Application demo](https://www.loom.com/share/b500cedbf4aa4f3f84798247edb2cd8e)** | the whole thing running | upload, state transitions, search, tenant isolation, observability |
+
+---
+
 ## Quick start
 
 ```bash
@@ -42,6 +55,9 @@ Everything else:
 ---
 
 ## Try it in five minutes
+
+All five steps are recorded in the [application demo](https://www.loom.com/share/b500cedbf4aa4f3f84798247edb2cd8e) if you would
+rather watch than install.
 
 1. **Upload a PDF** — *Add document*. The detail page shows three stages:
    `Stored → Queued for indexing → Searchable`. Each reads a real signal (the
@@ -156,22 +172,26 @@ all of them. That is the main reason the latency budget holds.
 
 ### The flows in detail
 
-| Flow | Diagram | Source | Written up |
-| --- | --- | --- | --- |
-| Write path — upload to searchable | [index.png](resources/index.png) | [.excalidraw](resources/index-flow.excalidraw) | [index-flow.md](resources/index-flow.md) |
-| Read path — search | [search.png](resources/search.png) | [.excalidraw](resources/search-flow.excalidraw) | [search-flow.md](resources/search-flow.md) |
-| Fetch, download, delete | [document.png](resources/document.png) | [.excalidraw](resources/document-flow.excalidraw) | — |
-| Sharding and capacity | — | — | [sizing.md](resources/sizing.md) |
-| Design document | — | — | [DESIGN.md](DESIGN.md) |
+| Flow | Diagram | Source | Written up | Walkthrough |
+| --- | --- | --- | --- | --- |
+| Write path — upload to searchable | [index.png](resources/index.png) | [.excalidraw](resources/index-flow.excalidraw) | [index-flow.md](resources/index-flow.md) | 🎥 [video](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a) |
+| Read path — search | [search.png](resources/search.png) | [.excalidraw](resources/search-flow.excalidraw) | [search-flow.md](resources/search-flow.md) | 🎥 [video](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2) |
+| Fetch, download, delete | [document.png](resources/document.png) | [.excalidraw](resources/document-flow.excalidraw) | — | — |
+| Sharding and capacity | — | — | [sizing.md](resources/sizing.md) | — |
+| Design document | — | — | [DESIGN.md](DESIGN.md) | — |
 
 <details>
 <summary><b>Write path</b> — the size tiers, the outbox transaction, extraction, retries and the DLQ</summary>
+
+Talked through in the [indexing walkthrough](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a).
 
 ![Index flow](resources/index.png)
 </details>
 
 <details>
 <summary><b>Read path</b> — two cache levels, the Elasticsearch query, the latency budget</summary>
+
+Talked through in the [search walkthrough](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2).
 
 ![Search flow](resources/search.png)
 </details>
