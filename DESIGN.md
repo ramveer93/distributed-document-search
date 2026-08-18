@@ -56,6 +56,116 @@ Postgres stays the source of truth and Elasticsearch is derived. That one
 decision is why the index needs no backups, why a mapping change is safe, and
 why search survives a Postgres outage.
 
+## Database design
+
+### Postgres — the source of truth
+
+```mermaid
+erDiagram
+    TENANTS ||--o{ TENANT_DOMAINS : has
+    TENANTS ||--o{ USERS : has
+    TENANTS ||--o{ DOCUMENTS : owns
+    DOCUMENTS ||--o{ INDEX_OUTBOX : "queues an event for"
+
+    TENANTS {
+        uuid tenant_id PK
+        string namespace UK "immutable, physical key everywhere else"
+        string display_name
+        string status "ACTIVE | SUSPENDED"
+        int rate_limit_rpm
+        smallint index_group "escape hatch: promote a whale to its own ES index"
+        timestamp created_at
+    }
+
+    TENANT_DOMAINS {
+        string domain PK
+        uuid tenant_id FK
+        timestamp verified_at
+        timestamp created_at
+    }
+
+    USERS {
+        uuid user_id PK
+        uuid tenant_id FK
+        string email UK
+        string password_hash
+        timestamp created_at
+    }
+
+    DOCUMENTS {
+        string tenant PK_FK "references tenants.namespace, not tenant_id"
+        uuid doc_id PK
+        string title
+        text body "NULL if the bytes live in S3 instead"
+        text s3_key "NULL if the body is inline"
+        string content_type
+        bigint byte_size
+        jsonb metadata
+        bigint version "guards against a stale event overwriting a newer one"
+        string status "PENDING | LIVE | FAILED | DELETED"
+        text failure_reason
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    INDEX_OUTBOX {
+        bigint seq PK
+        uuid doc_id
+        string tenant
+        string op "UPSERT | DELETE"
+        bigint version
+        string request_id "traces one document across the Kafka boundary"
+        timestamp published_at "NULL until the relay hands it to Kafka"
+        timestamp created_at
+    }
+```
+
+Two choices in that diagram are easy to miss and both matter:
+
+**`documents` is keyed on `(tenant, doc_id)`, not `doc_id` alone.** Every query
+that fetches a document already has to name a tenant to hit the primary key at
+all, so a wrong-tenant lookup returns no rows rather than depending on a handler
+remembering to add a `WHERE tenant = …` clause. The isolation is structural, not
+a habit.
+
+**`documents.tenant` references `tenants.namespace`, not `tenants.tenant_id`.**
+The UUID is the durable identity; the namespace is the short, readable string
+used as a physical key everywhere — S3 prefixes, Elasticsearch's tenant filter,
+Redis key prefixes, log lines. Foreign-keying on it here means every document
+row is human-readable without a join, at the cost of namespace being unable to
+ever change. That trade was made deliberately: an identity you can rename is an
+identity you eventually have to migrate everywhere it was copied.
+
+`body` and `s3_key` are mutually exclusive by a `CHECK` constraint — exactly one
+is set, never both, never neither. That one line is what makes "where are the
+bytes?" always answerable by looking at a single row instead of trying both
+places.
+
+`index_outbox` exists only so a document row and its "tell Kafka about this" row
+can commit in one transaction — see [Indexing](#indexing). Production replaces
+this table with Debezium reading the write-ahead log directly; nothing else in
+the schema changes.
+
+### Elasticsearch — the derived index
+
+Not a second database with its own migrations; a mapping, rebuildable at any
+time from the two tables above plus S3.
+
+| Field | Type | Why this type |
+| --- | --- | --- |
+| `tenant` | `keyword` | exact-match only, never analyzed — this is what the isolation filter matches on |
+| `doc_id` | `keyword` | exact-match, used to `GET` a specific document |
+| `title` | `text` + `keyword` subfield | `text` for ranked search, the `keyword` copy for exact-match or sorting |
+| `body` | `text` | the analyzed, searchable content |
+| `metadata` | `flattened` | arbitrary per-tenant fields (department, project, …) without a mapping change each time a new one appears |
+| `version` | `long` | the number `version_type=external` checks against, so a redelivered old event cannot overwrite newer data |
+| `created_at` | `date` | sorting and range filters |
+
+One index, shared by every tenant, with `routing=tenant` — documents for one
+tenant land on one shard, so a search touches one shard instead of all of them.
+The consequence for the mapping: `tenant` must be a `keyword`, because routing
+and the isolation filter both need an exact match, not a tokenized one.
+
 ## Indexing
 
 ![Indexing flow](resources/index.png)
