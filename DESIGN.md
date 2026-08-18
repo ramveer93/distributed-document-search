@@ -763,14 +763,16 @@ The brief leaves these open; each is a decision, not a given.
 | Read-your-writes | not required for search | permits async indexing; `GET /documents/{id}` *is* strongly consistent |
 | Tenant scale | thousands of tenants, skewed | one routed index, with a promotion path for whales |
 | Users per tenant | all users see all tenant documents | no per-user ACL, so the cache key needs no user dimension |
+| Onboarding | out of scope — tenants and users are seeded | signup would be an admin surface, not a search concern |
 
 ## What is not built
 
 Named plainly rather than left to be discovered: no idempotency on upload, no
 integration tests against real infrastructure, no OCR or passage chunking, no
-distributed tracing, no alert rules, no audit log. Presigned direct-to-S3
-upload is designed and diagrammed but the prototype streams through the API
-instead.
+distributed tracing, no alert rules, no audit log, and no per-tenant label on
+`documents_by_status` — so Grafana counts across all tenants while the UI shows
+one. Presigned direct-to-S3 upload is designed and diagrammed but the prototype
+streams through the API instead.
 
 There are 229 unit tests (`pytest`, ~4 s, no infrastructure required) covering
 the invariants this document argues for — tenant isolation in the cache key,

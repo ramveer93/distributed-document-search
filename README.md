@@ -286,20 +286,22 @@ Every row is a deliberate scope decision, not an unfinished one.
 
 ## Assumptions
 
-The brief does not state document size or format. Everything below follows
-from these, so they are the first things to challenge.
+The brief states no document size or format, so these are decisions rather than
+givens — and the first things to challenge. The four that shape what you will
+see when you run it:
 
 - **Documents are real files** — PDF, DOCX, HTML, plain text — not
   pre-extracted text snippets. This is what makes S3, the extraction step and
   the `/raw` + `/text` split necessary.
 - **~50 KB of extracted text per document**, which drives the shard maths in
-  [sizing.md](resources/sizing.md). At 5 KB it would be 3 shards, at 200 KB it
-  would be 80. Measure before committing — shard count is immutable.
-- **Bodies at or under 256 KB live in the Postgres row**, larger ones in S3.
-  A backend detail; no client sees it.
+  [sizing.md](resources/sizing.md). Measure before committing — shard count is
+  immutable.
 - **Onboarding is out of scope** — tenants and users are seeded.
 - **No OCR.** A scanned PDF is a visible `FAILED` state, not a silent empty
   document.
+
+The full set, with the reasoning behind each, is in
+[DESIGN.md](DESIGN.md#assumptions).
 
 ---
 
@@ -397,25 +399,29 @@ quietly.
 ```
 
 A measured optimisation, reproducible with `bench.sh`: `keys.public_key()` was
-re-parsing the RSA PEM on **every authenticated request** — 34.5 ms of the
-44 ms budget. Caching the derived key took p50 from **44.6 ms to 11.7 ms**.
-The first hypothesis (connection pooling) was wrong; bisecting hop by hop
-found it.
+re-parsing the RSA PEM on **every authenticated request**, costing 34.5 ms of a
+44.6 ms p50. Caching the derived key took p50 to **11.7 ms** — a 74% cut. How
+it was found, including the first hypothesis that measured wrong, is in
+[DESIGN.md](DESIGN.md#25-performance).
 
 ---
 
 ## Not built
 
-Stated plainly rather than left to be discovered:
+Gaps in the code you are about to run, stated plainly rather than left to be
+discovered:
 
-- **Integration tests.** The unit suite covers logic and the smoke suite
-  covers the running stack, but nothing tests the two together against real
-  Postgres, Kafka and Elasticsearch.
 - **Idempotency.** Uploading the same file twice creates two documents. The
   design calls for an `Idempotency-Key` deduped in Redis; it is not
   implemented.
-- **OCR, passage chunking, presigned upload** — see the table above.
+- **Integration tests.** The unit suite covers logic and the smoke suite
+  covers the running stack, but nothing tests the two together against real
+  Postgres, Kafka and Elasticsearch.
 - **Per-tenant metrics.** `documents_by_status` has no tenant label, so
   Grafana counts across all tenants while the UI shows one.
+- **OCR, passage chunking, presigned upload** — see the table above.
+
+What would additionally be needed for production — tracing, alert rules, audit
+logging — is in [DESIGN.md](DESIGN.md#2--production-readiness).
 
 ---
