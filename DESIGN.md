@@ -93,7 +93,7 @@ erDiagram
     }
 
     DOCUMENTS {
-        string tenant PK_FK "references tenants.namespace, not tenant_id"
+        string tenant PK "FK to tenants.namespace, not tenant_id"
         uuid doc_id PK
         string title
         text body "NULL if the bytes live in S3 instead"
