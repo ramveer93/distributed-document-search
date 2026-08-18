@@ -1,5 +1,7 @@
 # Deeprunner
 
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white) ![Flask](https://img.shields.io/badge/Flask-000000?style=flat&logo=flask&logoColor=white) ![React](https://img.shields.io/badge/React-61DAFB?style=flat&logo=react&logoColor=black) ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white) ![Vite](https://img.shields.io/badge/Vite-646CFF?style=flat&logo=vite&logoColor=white) ![Elasticsearch](https://img.shields.io/badge/Elasticsearch-005571?style=flat&logo=elasticsearch&logoColor=white) ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=flat&logo=postgresql&logoColor=white) ![Apache Kafka](https://img.shields.io/badge/Apache%20Kafka-231F20?style=flat&logo=apachekafka&logoColor=white) ![Redis](https://img.shields.io/badge/Redis-FF4438?style=flat&logo=redis&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat&logo=docker&logoColor=white) ![MinIO](https://img.shields.io/badge/MinIO-C72E49?style=flat&logo=minio&logoColor=white) ![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?style=flat&logo=prometheus&logoColor=white) ![Grafana](https://img.shields.io/badge/Grafana-F46800?style=flat&logo=grafana&logoColor=white)
+
 A multi-tenant document search service. Upload a PDF, DOCX or HTML file; the
 text is extracted asynchronously and becomes full-text searchable with
 relevance ranking, highlighting and facets — scoped to your tenant and nobody
@@ -10,6 +12,11 @@ Built against these targets: **10M+ documents · 1000+ searches/sec · p95 under
 
 Measured on this prototype: **p95 `/search` = 9 ms**, cache hit ~90%.
 
+> **The design document is [DESIGN.md](DESIGN.md)** — architecture and data
+> flows, production readiness (scale, resilience, security, operations, the
+> 99.95% SLA arithmetic, cost), and the trade-offs behind each decision.
+> This README is how to run and verify the thing.
+
 ---
 
 ## Walkthroughs
@@ -18,10 +25,10 @@ Three recorded walkthroughs — the two architecture ones talk through the
 Excalidraw diagrams, the third is the running application.
 
 | | | |
-| --- | --- | --- |
-| 🎥 **[Indexing architecture](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a)** | the write path | upload → S3 → outbox → Kafka → extraction → Elasticsearch |
-| 🎥 **[Search architecture](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2)** | the read path | two cache levels, routing, the tenant filter, the latency budget |
-| 🎥 **[Application demo](https://www.loom.com/share/b500cedbf4aa4f3f84798247edb2cd8e)** | the whole thing running | upload, state transitions, search, tenant isolation, observability |
+| :---: | --- | --- |
+| [![Watch the indexing walkthrough](https://img.shields.io/badge/%E2%96%B6%20Watch-Loom-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a) | **[Indexing architecture](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a)** — the write path | upload → S3 → outbox → Kafka → extraction → Elasticsearch |
+| [![Watch the search walkthrough](https://img.shields.io/badge/%E2%96%B6%20Watch-Loom-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2) | **[Search architecture](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2)** — the read path | two cache levels, routing, the tenant filter, the latency budget |
+| [![Watch the application demo](https://img.shields.io/badge/%E2%96%B6%20Watch-Loom-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/b500cedbf4aa4f3f84798247edb2cd8e) | **[Application demo](https://www.loom.com/share/b500cedbf4aa4f3f84798247edb2cd8e)** — the whole thing running | upload, state transitions, search, tenant isolation, observability |
 
 ---
 
@@ -38,7 +45,7 @@ Open **http://localhost:3001** and sign in.
 | Email | Tenant | Password | |
 | --- | --- | --- | --- |
 | `alice@acme.com` | acme | `demo` | 600 req/min |
-| `bob@globex.com` | globex | `demo` | a second tenant, for proving isolation |
+| `bob@globex.com` | globex | `demo` | 300 req/min — a second tenant, for proving isolation |
 | `carol@initech.com` | initech | `demo` | **suspended** — login returns 403 |
 
 Everything else:
@@ -54,10 +61,10 @@ Everything else:
 
 ---
 
-## Try it in five minutes
+## Try it in five steps
 
-All five steps are recorded in the [application demo](https://www.loom.com/share/b500cedbf4aa4f3f84798247edb2cd8e) if you would
-rather watch than install.
+All of it is recorded in the [application demo](https://www.loom.com/share/b500cedbf4aa4f3f84798247edb2cd8e) if you would rather
+watch than install.
 
 1. **Upload a PDF** — *Add document*. The detail page shows three stages:
    `Stored → Queued for indexing → Searchable`. Each reads a real signal (the
@@ -140,6 +147,44 @@ Errors are RFC 7807 `application/problem+json` and always carry `trace_id`.
 A cross-tenant read returns **404, not 403** — a 403 would confirm the
 document exists.
 
+### Rate limiting
+
+Per tenant, enforced **at the gateway** — an over-quota tenant is rejected
+before it burns any API, Elasticsearch or Postgres capacity. Limits come from
+the tenant row, so changing a customer's plan is an `UPDATE`, not a deploy:
+
+| Tenant | Limit |
+| --- | --- |
+| acme | 600 req/min |
+| globex | 300 req/min |
+
+Every authenticated response carries the current allowance:
+
+```
+X-RateLimit-Limit: 600
+X-RateLimit-Remaining: 597
+```
+
+Over the limit is a `429` that says when to come back — without `Retry-After`,
+most clients simply retry immediately and make the problem worse:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 37
+X-RateLimit-Remaining: 0
+
+{ "type": "/errors/rate-limited", "title": "Rate limit exceeded",
+  "status": 429, "detail": "600 requests/min exceeded", "trace_id": "r-…" }
+```
+
+A fixed window — one `INCR` plus one `EXPIRE` on `rl:{tenant}:{minute}`. A
+sliding window is more accurate but needs a sorted set per tenant, which is
+not worth it for fairness limiting. Rejected requests still count, so hammering
+past the limit cannot reset the window.
+
+`./scripts/smoke.sh` asserts the 429; `test_rate_limit.py` covers the window,
+the expiry and per-tenant isolation.
+
 ---
 
 ## Architecture
@@ -183,17 +228,17 @@ all of them. That is the main reason the latency budget holds.
 <details>
 <summary><b>Write path</b> — the size tiers, the outbox transaction, extraction, retries and the DLQ</summary>
 
-Talked through in the [indexing walkthrough](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a).
+[![Watch the indexing walkthrough](https://img.shields.io/badge/%E2%96%B6%20Watch-Loom-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a) — click the diagram to watch it talked through.
 
-![Index flow](resources/index.png)
+[![Index flow](resources/index.png)](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a)
 </details>
 
 <details>
 <summary><b>Read path</b> — two cache levels, the Elasticsearch query, the latency budget</summary>
 
-Talked through in the [search walkthrough](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2).
+[![Watch the search walkthrough](https://img.shields.io/badge/%E2%96%B6%20Watch-Loom-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2) — click the diagram to watch it talked through.
 
-![Search flow](resources/search.png)
+[![Search flow](resources/search.png)](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2)
 </details>
 
 <details>
