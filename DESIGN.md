@@ -8,15 +8,13 @@ Working code, `docker compose up`, and a Postman collection are in this
 repository — see the [README](README.md). This document is the reasoning
 behind it.
 
-**Recorded walkthroughs:** 🎥 [indexing architecture](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a) ·
-🎥 [search architecture](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2) · 🎥 [application demo](https://www.loom.com/share/b500cedbf4aa4f3f84798247edb2cd8e)
+[![Indexing walkthrough](https://img.shields.io/badge/%E2%96%B6%20Indexing%20walkthrough-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a) [![Search walkthrough](https://img.shields.io/badge/%E2%96%B6%20Search%20walkthrough-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2) [![Application demo](https://img.shields.io/badge/%E2%96%B6%20Application%20demo-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/b500cedbf4aa4f3f84798247edb2cd8e)
 
 | | |
 | --- | --- |
 | [1 · Architecture design](#1--architecture-design) | components, data flow, storage, API, consistency, caching, queue |
 | [2 · Production readiness](#2--production-readiness) | scale, resilience, security, observability, performance, operations, SLA, cost |
 | [3 · Experience showcase](#3--experience-showcase) | |
-| [4 · AI tool usage](#4--ai-tool-usage) | |
 
 ---
 
@@ -68,8 +66,9 @@ outage.
 
 ![Indexing flow](resources/index.png)
 
-Talked through in the 🎥 [indexing walkthrough](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a); full detail in
-[resources/index-flow.md](resources/index-flow.md).
+[![Indexing walkthrough](https://img.shields.io/badge/%E2%96%B6%20Indexing%20walkthrough-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a)
+
+Full detail in [resources/index-flow.md](resources/index-flow.md).
 
 ```
 POST /documents  →  bytes durable  →  Postgres row + outbox row (ONE txn)  →  202
@@ -108,8 +107,9 @@ document that silently matches nothing.
 
 ![Search flow](resources/search.png)
 
-Talked through in the 🎥 [search walkthrough](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2); full detail in
-[resources/search-flow.md](resources/search-flow.md).
+[![Search walkthrough](https://img.shields.io/badge/%E2%96%B6%20Search%20walkthrough-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2)
+
+Full detail in [resources/search-flow.md](resources/search-flow.md).
 
 ```
 GET /search  →  L1 (in-process, 5s)  →  L2 (Redis, 60s)  →  Elasticsearch, routed
@@ -686,16 +686,66 @@ out of the database is cheap in every dimension.
 
 # 3 · Experience showcase
 
+## A similar distributed system I've built
+
+I designed and implemented the task-management service that runs internal team
+communication for our organisation — a Front-style shared workspace where the
+searchable unit is a task's JSON payload rather than a document. It serves two
+quite different read patterns from one system: a per-tenant view scoped to a
+single customer, and a cross-tenant **cockpit** where internal users search,
+filter and group across every tenant at once while still performing full CRUD.
+At roughly **1,700 tenants averaging 1,000 tasks each — ~1.7M tasks and growing
+daily** — the cockpit's search, grouping and filtering could not be served from
+the operational store, which is what drove the split between the system of
+record and a dedicated search index.
+
+The write path separates durability from searchability. A create, update or
+delete commits to **NDB** first, which remains the source of truth, and then
+publishes to a queue — Kafka, or GCP Task Queue depending on the environment.
+An **indexer service** consumes from it, projects the task JSON into
+**Elasticsearch**, and writes the indexed status back to NDB so the UI can show
+where a task actually is. Intermittent failures retry with exponential backoff
+and fall through to a DLQ rather than stalling the consumer.
+
+## A performance optimisation with significant impact
+
+In that same service, every create, update and delete was paying for its own
+search indexing. The write path did the durable NDB commit *and* the
+Elasticsearch projection before returning, so users absorbed the cost of a
+subsystem they were not using at that moment — and the slowest, least reliable
+hop in the request was the one that mattered least to the caller. Indexing
+latency also varied with Elasticsearch load, which meant a slow cluster showed
+up as slow task operations, and an Elasticsearch problem could fail a write
+that had already durably committed. I split them: task operations now commit to
+NDB, publish to the queue, and return as soon as the write is durable, leaving
+the indexer to project into Elasticsearch asynchronously. **Task-operation
+latency dropped ~30%**, and the write path stopped inheriting Elasticsearch's
+availability. The deliberate trade was that cockpit search became eventually
+consistent — acceptable because the status write-back makes the lag observable
+rather than mysterious, and nobody creates a task and immediately searches for
+it.
+
+Three further changes targeted the read side, where 1.7M tasks made the cockpit
+the expensive surface. **Caching** in front of the cockpit's repeated filter and
+group queries removed most of the duplicate work, since internal users return to
+the same handful of views throughout a shift. **Pagination** moved off deep
+`from`/`size` paging to cursor-based `search_after` — at that row count, deep
+paging makes every shard collect and discard everything before the requested
+offset, so the cost grows with page depth for no benefit. And rather than
+indexing the whole task record, the indexer writes a **projection**: only the
+fields the cockpit actually searches, filters, groups and renders. That cut
+index size and per-write cost together, and made each hit cheaper to return.
+
 <!--
-    To be written.
--->
+    Still to write:
 
----
+    3. A critical production incident you resolved
+       — tasks not syncing to Elasticsearch (intermittent indexer/Kafka failure).
+         Needs: how it was detected, how it was diagnosed, how the out-of-sync
+         tasks were recovered, and what changed so it could not recur.
 
-# 4 · AI tool usage
-
-<!--
-    To be written.
+    4. An architectural decision that balanced competing concerns
+       — needs the option that was rejected, and what it would have cost.
 -->
 
 ---

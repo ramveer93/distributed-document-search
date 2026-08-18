@@ -226,29 +226,14 @@ all of them. That is the main reason the latency budget holds.
 | Design document | — | — | [DESIGN.md](DESIGN.md) | — |
 
 <details>
-<summary><b>Write path</b> — the size tiers, the outbox transaction, extraction, retries and the DLQ</summary>
-
-[![Watch the indexing walkthrough](https://img.shields.io/badge/%E2%96%B6%20Watch-Loom-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a) — click the diagram to watch it talked through.
-
-[![Index flow](resources/index.png)](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a)
-</details>
-
-<details>
-<summary><b>Read path</b> — two cache levels, the Elasticsearch query, the latency budget</summary>
-
-[![Watch the search walkthrough](https://img.shields.io/badge/%E2%96%B6%20Watch-Loom-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2) — click the diagram to watch it talked through.
-
-[![Search flow](resources/search.png)](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2)
-</details>
-
-<details>
 <summary><b>Fetch, download and delete</b> — 404-not-403, the primary-vs-replica read, soft delete and retention</summary>
 
 ![Document flow](resources/document.png)
 </details>
 
-All four are exported from [excalidraw.com](https://excalidraw.com), where the
-`.excalidraw` sources also open for editing.
+Every diagram is exported from [excalidraw.com](https://excalidraw.com), where
+the `.excalidraw` sources also open for editing. The write and read paths are
+shown in full, with their reasoning, in [DESIGN.md](DESIGN.md).
 
 ---
 
