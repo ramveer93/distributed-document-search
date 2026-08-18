@@ -22,7 +22,7 @@ Measured on this prototype: **p95 `/search` = 9 ms**, cache hit ~90%.
 ## Walkthroughs
 
 Three recorded walkthroughs — the two architecture ones talk through the
-Excalidraw diagrams, the third is the running application.
+diagrams, the third is the running application.
 
 | | | |
 | :---: | --- | --- |
@@ -216,16 +216,13 @@ all of them. That is the main reason the latency budget holds.
 
 ### The flows in detail
 
-| Flow | Diagram | Source | Written up | Walkthrough |
-| --- | --- | --- | --- | --- |
-| Write path — upload to searchable | [index.png](resources/index.png) | [.excalidraw](resources/index-flow.excalidraw) | [index-flow.md](resources/index-flow.md) | 🎥 [video](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a) |
-| Read path — search | [search.png](resources/search.png) | [.excalidraw](resources/search-flow.excalidraw) | [search-flow.md](resources/search-flow.md) | 🎥 [video](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2) |
-| Fetch, download, delete | [document.png](resources/document.png) | [.excalidraw](resources/document-flow.excalidraw) | [DESIGN.md](DESIGN.md#fetch-download-and-delete) | — |
-| Sharding and capacity | — | — | [sizing.md](resources/sizing.md) | — |
-| Design document | — | — | [DESIGN.md](DESIGN.md) | — |
-
-Every diagram is exported from [excalidraw.com](https://excalidraw.com), where
-the `.excalidraw` sources also open for editing.
+| Flow | Diagram | Written up | Walkthrough |
+| --- | --- | --- | --- |
+| Write path — upload to searchable | [index.png](resources/index.png) | [index-flow.md](resources/index-flow.md) | 🎥 [video](https://www.loom.com/share/5a0ed4dddc584da3822e1221f36f6a6a) |
+| Read path — search | [search.png](resources/search.png) | [search-flow.md](resources/search-flow.md) | 🎥 [video](https://www.loom.com/share/eabddd520637489ea87d590c932dc4b2) |
+| Fetch, download, delete | [document.png](resources/document.png) | [DESIGN.md](DESIGN.md#fetch-download-and-delete) | — |
+| Sharding and capacity | — | [sizing.md](resources/sizing.md) | — |
+| Design document | — | [DESIGN.md](DESIGN.md) | — |
 
 The assumptions everything rests on — document size, formats, extracted-text
 volume, consistency expectations — are listed in
