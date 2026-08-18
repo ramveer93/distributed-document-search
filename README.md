@@ -162,6 +162,7 @@ all of them. That is the main reason the latency budget holds.
 | Read path — search | [search.png](resources/search.png) | [.excalidraw](resources/search-flow.excalidraw) | [search-flow.md](resources/search-flow.md) |
 | Fetch, download, delete | [document.png](resources/document.png) | [.excalidraw](resources/document-flow.excalidraw) | — |
 | Sharding and capacity | — | — | [sizing.md](resources/sizing.md) |
+| Design document | — | — | [DESIGN.md](DESIGN.md) |
 
 <details>
 <summary><b>Write path</b> — the size tiers, the outbox transaction, extraction, retries and the DLQ</summary>
@@ -254,6 +255,8 @@ from these, so they are the first things to challenge.
 
 ## Observability
 
+![Observability](resources/observability.png)
+
 ```
 metrics   Prometheus → Grafana    RED per route, cache hit ratio, outbox depth,
                                   consumer lag, documents by status
@@ -261,18 +264,75 @@ logs      Loki       → Grafana    structured JSON, searchable by request_id
 traces    —                       not built; request_id correlation instead
 ```
 
-The metrics that matter here are the ones revealing **silent** failure. A
-failed index is visible — someone complains. A stuck relay, a lagging
-consumer, or a failed *delete* leaving a document still findable are not.
+**Prometheus pulls.** The services never push anywhere — they expose
+`/metrics` and print JSON to stdout. Alloy tails the Docker socket and ships
+the logs to Loki. Nothing inside a service knows either exists, which is why a
+rebuilt container is picked up again with no coordination.
 
-One request id flows gateway → api → outbox row → Kafka message → indexer, so
-a single grep follows a document from HTTP request to indexed:
+The metrics worth having are the ones revealing **silent** failure. A failed
+index is visible — someone complains. These are not:
+
+| | |
+| --- | --- |
+| `outbox_unpublished_depth` | growing → the relay is stuck; documents are being accepted and 202'd, and nothing will ever index them |
+| `kafka_consumer_lag` | growing → the index is drifting from the source of truth |
+| `documents_by_status{status="FAILED"}` | a backlog nobody is draining |
+| DLQ depth | **alert at > 0, not > 100** — one dead-lettered `DELETE` means a document the user removed is still findable |
+
+`request_id` is deliberately **not** a Prometheus label. One time series per
+unique label combination means a label per request would mint a permanent
+series every time and take the TSDB down. Labels stay bounded — `service`,
+`method`, `route`, `status` — and `route` is the *route rule*
+(`/documents/<doc_id>`), never the path, for the same reason.
+
+High-cardinality identifiers live in the log line instead, where Loki parses
+them at query time:
+
+```
+{job="deeprunner"} | json | request_id = "r-f3219a8948b0"
+```
+
+One id flows gateway → api → outbox row → Kafka message → indexer, so a single
+grep follows a document from HTTP request to indexed:
 
 ```bash
 docker compose logs gateway api indexer | grep r-f3219a8948b0
 ```
 
 Or paste it into the **Request ID** box on the Grafana dashboard.
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest                                # 229 tests, ~4s, nothing needs to be running
+pytest backend/tests/test_consumer.py -v
+```
+
+Every external dependency is an in-process double, so the suite runs with no
+docker and no network. What is covered is the logic where a bug is silent —
+cache keys, the tenant filter, the indexer's status gate, extraction edge
+cases — rather than the plumbing that fails loudly on first use.
+
+| | |
+| --- | --- |
+| `test_search_cache.py` | tenant isolation in the cache key, version invalidation, L1/L2 |
+| `test_search_query.py` | routing, `filter`-not-`must`, boosting, facet namespacing |
+| `test_auth.py` | RS256, the HS256 confusion attack, expiry, audience, login |
+| `test_consumer.py` | the PENDING gate, version guard, delete paths, invalidation |
+| `test_extraction.py` | magic-byte sniffing, the OCR guard, corrupt files |
+| `test_write_path.py` | the 256 KB split, S3-before-row, doc_id/key derivation |
+| `test_read_path.py` | 404-not-403, malformed ids, progress states |
+| `test_gateway_proxy.py` | header allowlist, spoofed identity, trace propagation |
+| `test_rate_limit.py` | per-tenant windows, expiry, `Retry-After` |
+| `test_errors.py` | RFC 7807 shape, no internals in a 500 |
+
+The suite was checked by mutation: breaking each design invariant in turn —
+dropping the tenant from the cache key, allowing HS256, removing the `PENDING`
+gate, writing the row before the S3 bytes — makes tests fail rather than pass
+quietly.
 
 ---
 
@@ -298,8 +358,9 @@ found it.
 
 Stated plainly rather than left to be discovered:
 
-- **Automated tests.** The smoke suite covers behaviour end to end, but there
-  are no unit tests. This is the largest gap against "testable code".
+- **Integration tests.** The unit suite covers logic and the smoke suite
+  covers the running stack, but nothing tests the two together against real
+  Postgres, Kafka and Elasticsearch.
 - **Idempotency.** Uploading the same file twice creates two documents. The
   design calls for an `Idempotency-Key` deduped in Redis; it is not
   implemented.
