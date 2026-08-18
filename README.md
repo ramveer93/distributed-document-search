@@ -189,9 +189,8 @@ the expiry and per-tenant isolation.
 
 ## Architecture
 
-![High-level architecture](resources/overall.png)
-
-Six decisions worth knowing:
+The full treatment — diagrams, data flows, trade-offs — is in
+**[DESIGN.md](DESIGN.md)**. Six decisions worth knowing up front:
 
 **Writes are asynchronous, and say so.** `POST /documents` returns **202
 PENDING**, not 201. The document is durable but not yet searchable. Claiming
@@ -232,8 +231,11 @@ all of them. That is the main reason the latency budget holds.
 </details>
 
 Every diagram is exported from [excalidraw.com](https://excalidraw.com), where
-the `.excalidraw` sources also open for editing. The write and read paths are
-shown in full, with their reasoning, in [DESIGN.md](DESIGN.md).
+the `.excalidraw` sources also open for editing.
+
+The assumptions everything rests on — document size, formats, extracted-text
+volume, consistency expectations — are listed in
+[DESIGN.md](DESIGN.md#assumptions).
 
 ---
 
@@ -281,27 +283,6 @@ Every row is a deliberate scope decision, not an unfinished one.
 | Migrations | `create_all()` at startup | Alembic |
 | Key management | RS256 keypair generated in-process | an OIDC provider (Cognito/Auth0/Keycloak) |
 | Tracing | `request_id` correlated in logs, searchable in Grafana | OpenTelemetry spans, with `traceparent` carried across Kafka |
-
----
-
-## Assumptions
-
-The brief states no document size or format, so these are decisions rather than
-givens — and the first things to challenge. The four that shape what you will
-see when you run it:
-
-- **Documents are real files** — PDF, DOCX, HTML, plain text — not
-  pre-extracted text snippets. This is what makes S3, the extraction step and
-  the `/raw` + `/text` split necessary.
-- **~50 KB of extracted text per document**, which drives the shard maths in
-  [sizing.md](resources/sizing.md). Measure before committing — shard count is
-  immutable.
-- **Onboarding is out of scope** — tenants and users are seeded.
-- **No OCR.** A scanned PDF is a visible `FAILED` state, not a silent empty
-  document.
-
-The full set, with the reasoning behind each, is in
-[DESIGN.md](DESIGN.md#assumptions).
 
 ---
 
